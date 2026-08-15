@@ -1,0 +1,9 @@
+﻿<Application x:Class="EnvEditor.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:EnvEditor">
+    <Application.Resources>
+        <local:InverseBoolConverter x:Key="InvBool"/>
+        <local:StateToBrushConverter x:Key="StateBrush"/>
+    </Application.Resources>
+</Application>
