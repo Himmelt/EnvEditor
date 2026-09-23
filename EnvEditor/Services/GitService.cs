@@ -39,13 +39,16 @@ public sealed class GitService
     public void EnsureRepo()
     {
         if (!Repository.IsValid(_localPath))
-        {
             Repository.Init(_localPath);
-            using var repo = new Repository(_localPath);
-            if (repo.Network.Remotes["origin"] is null)
-                repo.Network.Remotes.Add("origin", _remoteUrl);
-        }
+
         using var r = new Repository(_localPath);
+        // 仓库地址可能被改过，这里始终对齐，否则会一直推送到旧 remote
+        var origin = r.Network.Remotes["origin"];
+        if (origin is null)
+            r.Network.Remotes.Add("origin", _remoteUrl);
+        else if (!string.Equals(origin.Url, _remoteUrl, StringComparison.OrdinalIgnoreCase))
+            r.Network.Remotes.Update("origin", u => u.Url = _remoteUrl);
+
         Fetch(r);
     }
 

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Linq;
 using System.Text.Json;
 using System.IO;
@@ -22,6 +23,12 @@ public sealed partial class MainViewModel : ObservableObject
     private AppConfig _config = new();
     private SyncPayload? _remotePayload;
     private CancellationTokenSource? _cts;
+
+    // 最近一次 Recompute 的快照，供勾选框切换时就地重算状态
+    private Dictionary<string, UserVariable> _localMap = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, VarEntry> _remoteMap = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _unsupported = new(StringComparer.OrdinalIgnoreCase);
+    private bool _suppressRowEvents;
 
     private static string RepoLocalPath =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EnvEditor", "repo");
@@ -107,6 +114,8 @@ public sealed partial class MainViewModel : ObservableObject
         CredentialTarget = _config.CredentialTarget;
         PatInput = _config.PatProtected ?? "";
         RememberEnvPassword = _config.RememberEnvPassword;
+        // 回填上次"记住"的解密密钥；DPAPI 解不出（换机器/改密码）时为 null，需用户重新输入
+        PasswordInput = RememberEnvPassword ? _config.EnvPasswordProtected ?? "" : "";
         Recompute();
         SetStatus("配置已加载");
     }
@@ -114,6 +123,9 @@ public sealed partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void SaveConfig()
     {
+        // 输入框为空时保留已存的密文，避免密码框为空就把"记住的"密钥/PAT 静默清空
+        var pat = string.IsNullOrEmpty(PatInput) ? _config.PatProtected : PatInput;
+        var pwd = string.IsNullOrEmpty(PasswordInput) ? _config.EnvPasswordProtected : PasswordInput;
         _config = new AppConfig
         {
             RepoUrl = RepoUrl,
@@ -124,11 +136,13 @@ public sealed partial class MainViewModel : ObservableObject
             UseSystemCredential = UseSystemCredential,
             CredentialTarget = CredentialTarget,
             RememberEnvPassword = RememberEnvPassword,
-            PatProtected = PatInput,
-            EnvPasswordProtected = RememberEnvPassword ? PasswordInput : null
+            PatProtected = pat,
+            EnvPasswordProtected = RememberEnvPassword ? pwd : null
         };
         _configStore.Save(_config);
-        SetStatus("配置已保存");
+        SetStatus(RememberEnvPassword && !string.IsNullOrEmpty(pwd)
+            ? "配置已保存（解密密钥已记住，下次启动自动回填）"
+            : "配置已保存");
     }
 
     private string ResolvePat()
@@ -175,7 +189,9 @@ public sealed partial class MainViewModel : ObservableObject
         }
         catch (DecryptionFailedException ex)
         {
-            SetStatus("解密失败：" + ex.Message);
+            SetStatus(ex.Ambiguous
+                ? "解密失败：密钥错误或数据已损坏（二者无法区分）。请确认解密密钥；若密钥已遗忘，远端数据无法恢复。"
+                : "解密失败：" + ex.Message);
         }
         catch (Exception ex)
         {
@@ -270,7 +286,10 @@ public sealed partial class MainViewModel : ObservableObject
         }, token);
         _remotePayload = payload;
         Recompute();
-        SetStatus($"上传完成：{count} 个变量已同步到远端");
+        // 未勾选但远端存在的变量会被本次整体覆盖删除，明确告知
+        var removed = Rows.Count(r => r.State == SyncState.PendingRemove);
+        SetStatus($"上传完成：{count} 个变量已同步到远端"
+                  + (removed > 0 ? $"，另有 {removed} 个未勾选变量已从远端移除" : ""));
     }, "正在上传…");
 
     // ── 测试连接 ──
@@ -372,83 +391,119 @@ public sealed partial class MainViewModel : ObservableObject
     private void Recompute()
     {
         var local = _env.ReadAll();
-        var localMap = local.ToDictionary(v => v.Name, v => v, StringComparer.OrdinalIgnoreCase);
+        _localMap = local.ToDictionary(v => v.Name, v => v, StringComparer.OrdinalIgnoreCase);
         var remote = _remotePayload?.Variables ?? new List<VarEntry>();
-        var remoteMap = remote.ToDictionary(v => v.Name, v => v, StringComparer.OrdinalIgnoreCase);
-        var unsupported = _env.ReadUnsupportedNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _remoteMap = remote.ToDictionary(v => v.Name, v => v, StringComparer.OrdinalIgnoreCase);
+        _unsupported = _env.ReadUnsupportedNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
         var prevSel = Rows.ToDictionary(r => r.Name, r => r.IsWhitelisted, StringComparer.OrdinalIgnoreCase);
+        var prevSelectedName = SelectedRow?.Name;
 
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var n in localMap.Keys) names.Add(n);
-        foreach (var n in remoteMap.Keys) names.Add(n);
-        foreach (var n in unsupported) names.Add(n);
+        foreach (var n in _localMap.Keys) names.Add(n);
+        foreach (var n in _remoteMap.Keys) names.Add(n);
+        foreach (var n in _unsupported) names.Add(n);
 
         var next = new ObservableCollection<VariableRow>();
-        foreach (var name in names)
+        _suppressRowEvents = true; // 重建期间 IsWhitelisted 赋值会触发事件，这里统一抑制
+        try
         {
-            localMap.TryGetValue(name, out var lv);
-            remoteMap.TryGetValue(name, out var rv);
-            var row = new VariableRow
+            foreach (var name in names)
             {
-                Name = name,
-                LocalValue = lv?.Value ?? "",
-                Kind = lv?.Kind ?? rv?.Kind ?? VariableKind.String,
-                RemoteValue = rv?.Value ?? "",
-                IsHighRisk = _env.IsHighRisk(name)
-            };
+                _localMap.TryGetValue(name, out var lv);
+                _remoteMap.TryGetValue(name, out var rv);
+                var row = new VariableRow
+                {
+                    Name = name,
+                    LocalValue = lv?.Value ?? "",
+                    Kind = lv?.Kind ?? rv?.Kind ?? VariableKind.String,
+                    RemoteValue = rv?.Value ?? "",
+                    IsHighRisk = _env.IsHighRisk(name)
+                };
 
-            if (unsupported.Contains(name))
-            {
-                row.State = SyncState.Unsupported;
-                row.Warning = "类型不支持同步（REG_MULTI_SZ 等）";
-                row.IsWhitelisted = false;
+                // 白名单默认：远端有且非高危则默认勾选（pull 后可直接应用）；否则沿用上次选择
+                var selected = rv is not null && !row.IsHighRisk;
+                if (prevSel.TryGetValue(name, out var wasSel)) selected = wasSel;
+                row.IsWhitelisted = selected;
+
+                ApplyState(row, lv, rv);
+                row.PropertyChanged += OnRowPropertyChanged;
                 next.Add(row);
-                continue;
             }
-
-            // 白名单默认：pull 后远端变量默认勾选（高危除外）；否则沿用上次选择
-            var selected = remoteMap.ContainsKey(name) && !row.IsHighRisk;
-            if (prevSel.TryGetValue(name, out var wasSel)) selected = wasSel;
-            row.IsWhitelisted = selected;
-
-            if (!row.IsWhitelisted)
-            {
-                if (remoteMap.ContainsKey(name) && wasSel)
-                {
-                    row.State = SyncState.PendingRemove;
-                    row.Warning = "取消勾选 = 下次上传移除";
-                }
-                else
-                {
-                    row.State = SyncState.NotTracked;
-                    row.Warning = remoteMap.ContainsKey(name) ? "未勾选，不参与同步" : "";
-                }
-            }
-            else if (lv is null && rv is not null)
-            {
-                row.State = SyncState.RemoteOnly;
-                row.Warning = "远端有、本机无（应用后新增）";
-            }
-            else if (lv is not null && rv is null)
-            {
-                row.State = SyncState.LocalOnly;
-                row.Warning = "本机有、远端无（上传新增）";
-            }
-            else if (lv is not null && rv is not null)
-            {
-                if (lv.Value == rv.Value && lv.Kind == rv.Kind)
-                {
-                    row.State = SyncState.InSync;
-                    row.Warning = "";
-                }
-                else
-                {
-                    row.State = SyncState.Different;
-                    row.Warning = "值不同（应用 = 远端覆盖本地）";
-                }
-            }
-            next.Add(row);
         }
+        finally
+        {
+            _suppressRowEvents = false;
+        }
+
         Rows = next;
+
+        // Rows 重建 + ApplyFilter 会清空选中项，按名称恢复
+        if (prevSelectedName is not null)
+            SelectedRow = FilteredRows.FirstOrDefault(
+                r => r.Name.Equals(prevSelectedName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>就地重算单行状态。勾选框切换时由 <see cref="OnRowPropertyChanged"/> 调用。</summary>
+    private void ApplyState(VariableRow row, UserVariable? lv, VarEntry? rv)
+    {
+        if (_unsupported.Contains(row.Name))
+        {
+            row.State = SyncState.Unsupported;
+            row.Warning = "类型不支持同步（REG_MULTI_SZ 等）";
+            row.IsWhitelisted = false;
+            return;
+        }
+
+        if (!row.IsWhitelisted)
+        {
+            // 上传是整体覆盖 payload，故"未勾选 + 远端存在"等于下次上传会删掉远端那份
+            if (rv is not null)
+            {
+                row.State = SyncState.PendingRemove;
+                row.Warning = "未勾选 → 下次上传将从远端移除";
+            }
+            else
+            {
+                row.State = SyncState.NotTracked;
+                row.Warning = "";
+            }
+        }
+        else if (lv is null && rv is not null)
+        {
+            row.State = SyncState.RemoteOnly;
+            row.Warning = "远端有、本机无（应用后新增）";
+        }
+        else if (lv is not null && rv is null)
+        {
+            row.State = SyncState.LocalOnly;
+            row.Warning = "本机有、远端无（上传新增）";
+        }
+        else if (lv is not null && rv is not null)
+        {
+            if (lv.Value == rv.Value && lv.Kind == rv.Kind)
+            {
+                row.State = SyncState.InSync;
+                row.Warning = "";
+            }
+            else
+            {
+                row.State = SyncState.Different;
+                row.Warning = "值不同（应用 = 远端覆盖本地）";
+            }
+        }
+        else
+        {
+            row.State = SyncState.NotTracked;
+            row.Warning = "";
+        }
+    }
+
+    private void OnRowPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_suppressRowEvents || e.PropertyName != nameof(VariableRow.IsWhitelisted)) return;
+        if (sender is not VariableRow row) return;
+        _localMap.TryGetValue(row.Name, out var lv);
+        _remoteMap.TryGetValue(row.Name, out var rv);
+        ApplyState(row, lv, rv);
     }
 }

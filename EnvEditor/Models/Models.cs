@@ -31,7 +31,9 @@ public sealed class AppConfig
     public bool UseSystemCredential { get; set; }
     public string CredentialTarget { get; set; } = ""; // 留空则按仓库 host 推导
 
-    // 经 DPAPI 保护的敏感字段；明文为 null。读不到（换机器/改密码）时为 null。
+    // 命名沿用落盘字段名，但内存中的 AppConfig 里这两项装的是**明文**：
+    // ConfigStore.Load 解密后回填、ConfigStore.Save 落盘前再 DPAPI 加密。
+    // 解不出（换机器/改 Windows 密码）时为 null，表示用户需重新输入。
     public string? PatProtected { get; set; }
     public string? EnvPasswordProtected { get; set; }
     public bool RememberEnvPassword { get; set; }

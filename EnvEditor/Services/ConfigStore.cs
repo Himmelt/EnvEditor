@@ -11,16 +11,23 @@ namespace EnvEditor.Services;
 /// </summary>
 public sealed class ConfigStore
 {
-    private static readonly string Dir =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "EnvEditor");
-    private static readonly string FilePath = Path.Combine(Dir, "config.json");
+    private readonly string _dir;
+    private readonly string _filePath;
+
+    /// <summary>目录留空则用 %APPDATA%\EnvEditor；测试可注入临时目录。</summary>
+    public ConfigStore(string? directory = null)
+    {
+        _dir = directory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "EnvEditor");
+        _filePath = Path.Combine(_dir, "config.json");
+    }
 
     public AppConfig Load()
     {
-        if (!File.Exists(FilePath)) return new AppConfig();
+        if (!File.Exists(_filePath)) return new AppConfig();
         try
         {
-            var json = File.ReadAllText(FilePath);
+            var json = File.ReadAllText(_filePath);
             var cfg = JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
             // 反序列化敏感字段为明文（DPAPI 解密失败返回 null）
             cfg.PatProtected = TryUnprotect(cfg.PatProtected);
@@ -35,7 +42,7 @@ public sealed class ConfigStore
 
     public void Save(AppConfig cfg)
     {
-        Directory.CreateDirectory(Dir);
+        Directory.CreateDirectory(_dir);
         var toSave = new AppConfig
         {
             RepoUrl = cfg.RepoUrl,
@@ -50,7 +57,7 @@ public sealed class ConfigStore
             EnvPasswordProtected = cfg.RememberEnvPassword ? TryProtect(cfg.EnvPasswordProtected) : null
         };
         var json = JsonSerializer.Serialize(toSave, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(FilePath, json);
+        File.WriteAllText(_filePath, json);
     }
 
     // ── DPAPI 辅助 ──
